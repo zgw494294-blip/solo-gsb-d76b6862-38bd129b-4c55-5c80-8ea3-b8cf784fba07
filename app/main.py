@@ -3,18 +3,19 @@ from __future__ import annotations
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from .engine import ValidationError, prune, review, revise
-from .models import PruneRequest, ReviewRequest, ReviseRequest
+from .engine import ValidationError, prune, rename_source_columns, review, revise
+from .models import PruneRequest, RenameRequest, ReviewRequest, ReviseRequest
 
 app = FastAPI(
     title="Local Data Export Risk Review API",
     description=(
         "Reviews every output column of an export node for sensitive content "
         "provenance and sensitive row-level influence, can revise a blocked "
-        "graph into a re-submittable, review-safe export, and can prune a graph "
-        "down to a chosen subset of export columns."
+        "graph into a re-submittable, review-safe export, can prune a graph "
+        "down to a chosen subset of export columns, and can rename columns of "
+        "a source node while keeping every in-graph reference valid."
     ),
-    version="1.2.0",
+    version="1.3.0",
 )
 
 
@@ -50,3 +51,8 @@ async def revise_export(request: ReviseRequest) -> dict[str, object]:
 @app.post("/api/prune")
 async def prune_export(request: PruneRequest) -> dict[str, object]:
     return prune(request)
+
+
+@app.post("/api/rename")
+async def rename_export(request: RenameRequest) -> dict[str, object]:
+    return rename_source_columns(request)

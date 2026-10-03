@@ -29,6 +29,7 @@ from .models import (
     JoinNodeIn,
     ProjectionNodeIn,
     PruneRequest,
+    RenameRequest,
     ReviewRequest,
     ReviseRequest,
     SourceNodeIn,
@@ -277,7 +278,7 @@ def _build_by_id(nodes: list[object]) -> dict[str, object]:
 
 
 def _evaluate_graph(
-    request: Union[ReviewRequest, ReviseRequest, PruneRequest],
+    request: Union[ReviewRequest, ReviseRequest, PruneRequest, RenameRequest],
 ) -> tuple[dict[str, object], list[str], dict[str, Relation]]:
     """Run every original validation rule and evaluate all relations.
 
@@ -785,4 +786,207 @@ def prune(request: PruneRequest) -> dict[str, object]:
         "dropped_nodes": dropped_nodes,
         "added_projection": final_export if added_node else None,
         "review": pruned_review,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Renaming source columns
+# ---------------------------------------------------------------------------
+
+
+def _mapped_reasons(
+    reasons: list[dict[str, str]], source_id: str, rename: dict[str, str]
+) -> list[dict[str, str]]:
+    """Map origin column names of the renamed source, keeping sort order.
+
+    Origins of *other* sources are left untouched even when a column name
+    coincides with a renamed one: provenance is keyed by ``(node_id, column)``.
+    """
+    return [
+        {
+            "node_id": r["node_id"],
+            "column": rename.get(r["column"], r["column"])
+            if r["node_id"] == source_id
+            else r["column"],
+        }
+        for r in reasons
+    ]
+
+
+def rename_source_columns(request: RenameRequest) -> dict[str, object]:
+    """Rename columns of one source while keeping every in-graph reference valid.
+
+    The whole original graph is validated under exactly the same rules as
+    :func:`review` first, including branches the export never reaches. The
+    renames apply simultaneously on the named source node (swaps are legal) and
+    propagate down every downstream branch of that source:
+
+    * a filter renames its predicate references and keeps passing the renamed
+      columns straight through;
+    * a projection renames its ``copy`` references (output names do not change);
+    * a join renames its two keys and the per-side output ``column`` references
+      (aliases do not change).
+
+    Renaming stops at projection output names and join aliases: names introduced
+    there never change, so everything further downstream stays untouched.
+    Sensitive flags, constant values and identically named columns of other
+    sources are never modified. Nodes, columns, ids, edges and orders are all
+    preserved. The request is rejected wholesale (without a partial graph) for
+    an invalid source, a missing old column, a resulting duplicate source
+    column name, or a re-review that does not match the original review after
+    mapping its source column names.
+    """
+    by_id, order, relations = _evaluate_graph(request)
+
+    source_node = by_id.get(request.source)
+    if not isinstance(source_node, SourceNodeIn):
+        raise ValidationError(
+            "RENAME_INVALID_SOURCE",
+            f"rename source node '{request.source}' does not exist or is not a "
+            "source node",
+            request.source,
+        )
+
+    source_columns = [col.name for col in source_node.columns]
+    source_column_set = set(source_columns)
+
+    rename: dict[str, str] = {}
+    for item in request.renames:
+        if item.old_name not in source_column_set:
+            raise ValidationError(
+                "RENAME_COLUMN_NOT_FOUND",
+                f"column '{item.old_name}' to rename does not exist on source "
+                f"node '{request.source}'",
+                request.source,
+                {"column": item.old_name},
+            )
+        rename[item.old_name] = item.new_name
+
+    # Apply simultaneously and reject any final duplicate in the source.
+    new_names = [rename.get(name, name) for name in source_columns]
+    if len(set(new_names)) != len(new_names):
+        dupes = sorted({n for n in new_names if new_names.count(n) > 1})
+        raise ValidationError(
+            "RENAME_CONFLICT",
+            "the rename would produce duplicate source column names on "
+            f"'{request.source}': " + ", ".join(dupes),
+            request.source,
+            {"columns": dupes},
+        )
+
+    original_review = _review_export(request.export, relations)
+
+    # --- per-node output rename maps (topological order) --------------------
+    # Maps the original name of a column a node emits to its new name. A name
+    # change flows only through filters (transparent pass-through); projection
+    # output names and join aliases freeze it, so their maps are empty.
+    out_maps: dict[str, dict[str, str]] = {}
+    for nid in order:
+        node = by_id[nid]
+        if isinstance(node, SourceNodeIn):
+            out_maps[nid] = dict(rename) if nid == request.source else {}
+        elif isinstance(node, (ProjectionNodeIn, JoinNodeIn)):
+            out_maps[nid] = {}
+        else:  # FilterNodeIn: keeps every input column under the same mapping
+            out_maps[nid] = out_maps[node.input]
+
+    # --- mutate serialized copies; ids, edges and order stay untouched ------
+    new_node_dicts: list[dict[str, object]] = []
+    for node in request.nodes:
+        nid = node.id
+        data = serialize_node(node)
+
+        if isinstance(node, SourceNodeIn) and nid == request.source:
+            for col in data["columns"]:
+                if col["name"] in rename:
+                    col["name"] = rename[col["name"]]
+
+        elif isinstance(node, ProjectionNodeIn):
+            mapping = out_maps[node.input]
+            for col in data["columns"]:
+                if "copy" in col and col["copy"] in mapping:
+                    col["copy"] = mapping[col["copy"]]
+
+        elif isinstance(node, FilterNodeIn):
+            mapping = out_maps[node.input]
+            data["references"] = [mapping.get(r, r) for r in data["references"]]
+
+        elif isinstance(node, JoinNodeIn):
+            left_map = out_maps[node.left_input]
+            right_map = out_maps[node.right_input]
+            if data["left_key"] in left_map:
+                data["left_key"] = left_map[data["left_key"]]
+            if data["right_key"] in right_map:
+                data["right_key"] = right_map[data["right_key"]]
+            for out in data["outputs"]:
+                mapping = left_map if out["side"] == "left" else right_map
+                if out["column"] in mapping:
+                    out["column"] = mapping[out["column"]]
+
+        new_node_dicts.append(data)
+
+    # --- validate and re-review under the original rules --------------------
+    re_payload = ReviewRequest.model_validate(
+        {"nodes": new_node_dicts, "export": request.export}
+    )
+    _re_by_id, _re_order, re_relations = _evaluate_graph(re_payload)
+    new_review = _review_export(request.export, re_relations)
+
+    export_map = out_maps[request.export]
+    if len(new_review["columns"]) != len(original_review["columns"]):  # pragma: no cover
+        raise ValidationError(
+            "RENAME_REVIEW_MISMATCH",
+            "internal error: the rename changed the number of export columns",
+            request.export,
+        )
+    for old_col, new_col in zip(
+        original_review["columns"], new_review["columns"]
+    ):
+        mapped_name = export_map.get(old_col["name"], old_col["name"])
+        expected = {
+            "name": mapped_name,
+            "blocked": old_col["blocked"],
+            "content_reasons": _mapped_reasons(
+                old_col["content_reasons"], request.source, rename
+            ),
+            "row_reasons": _mapped_reasons(
+                old_col["row_reasons"], request.source, rename
+            ),
+        }
+        actual = {
+            "name": new_col["name"],
+            "blocked": new_col["blocked"],
+            "content_reasons": new_col["content_reasons"],
+            "row_reasons": new_col["row_reasons"],
+        }
+        if expected != actual:
+            raise ValidationError(
+                "RENAME_REVIEW_MISMATCH",
+                "the re-review after renaming does not match the original "
+                "review mapped to the new source column names",
+                request.export,
+                {
+                    "column": old_col["name"],
+                    "expected": expected,
+                    "actual": actual,
+                },
+            )
+    if original_review["blocked"] != new_review["blocked"]:  # pragma: no cover
+        raise ValidationError(
+            "RENAME_REVIEW_MISMATCH",
+            "internal error: the rename changed the overall blocked conclusion",
+            request.export,
+        )
+
+    renamed_columns = [
+        {"old_name": old, "new_name": new}
+        for old, new in rename.items()
+        if old != new
+    ]
+
+    return {
+        "nodes": new_node_dicts,
+        "export": request.export,
+        "review": new_review,
+        "renamed_columns": renamed_columns,
     }

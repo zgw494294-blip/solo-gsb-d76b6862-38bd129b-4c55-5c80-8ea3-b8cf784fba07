@@ -16,6 +16,10 @@
 需求取并集）；最终导出只含选定列（沿用原列序），所选列的内容与行影响原因与原图完全一致，
 详见下文“按导出列精简”。
 
+此外提供 `POST /api/rename`：对一个源节点的若干列**批量改名**（同时生效、允许互换），
+图内引用随各节点输入自动改写、仍指向原来的列；投影输出名与连接别名不变，名称变化在那里
+停止。节点与列不增删，复审结论与原图一致，详见下文“源列批量改名”。
+
 ## 风险传播规则
 
 | 节点 | 行为 | 内容影响 | 行影响 |
@@ -473,6 +477,130 @@ curl -s -i -X POST http://localhost:8080/api/prune \
 # HTTP/1.1 400 ... {"error":{"code":"PRUNE_COLUMN_NOT_FOUND", ...
 ```
 
+## 源列批量改名：POST /api/rename
+
+给一个**源节点**的若干列批量改名，并让图内引用仍指向原来的列。请求体在审查请求基础上增加
+`source`（一个源节点 ID）与非空的 `renames` 列表，每项为 `{"old_name": "...", "new_name": "..."}`：
+
+* **原名按原图解析且必须互异**（重复原名是 schema 错误，返回 422）；
+* **新名非空**（空字符串、字段类型不符等 schema 问题返回 422）；
+* 改名**同时生效，允许互换**（如 `a→b`、`b→a`）；允许新名与原名相同（该项不计入
+  `renamed_columns`）；
+* 改名后该源的最终列名**不得重复**（含与未参与改名的列撞名），否则整次拒绝。
+
+整张图先按 `/api/review` 的原规则校验，原有错误行为不变（含导出不可达分支上的错误）。
+
+### 改名传播规则
+
+沿该源的**所有下游分支**传播（包括不属于导出祖先的分支），但只改写“按各自输入”的引用，
+名称变化在投影输出名与连接别名处**停止**：
+
+| 节点 | 改名行为 |
+|---|---|
+| `source`（仅 `source` 指定的那个源） | 列改名，列序与 `sensitive` 标记原样保留 |
+| `filter` | 条件 `references` 随其输入改名；继续透传全部输入列（筛选导出时，透传的导出列名随之变化） |
+| `projection` | 各列 `copy` 随其输入改名；**输出 `name` 不变**，常量列的 `constant` 值不动 |
+| `join` | `left_key` / `right_key` 及每个输出的 `column` 按**各自一侧**输入改名；**输出 `alias` 不变** |
+
+其他源的同名列、`sensitive` 标记、常量值一律不动。**节点和列不增删**，节点 ID、输入关系
+及节点内列/别名/引用顺序全部不变（其他源的同名列与该源重名无关）。
+
+### 拒绝（HTTP 400，不返回部分图）
+
+* `source` 节点不存在或不是 source 节点：`RENAME_INVALID_SOURCE`；
+* 某个 `old_name` 在该源上不存在（即使图本身其他地方有错也先按原图校验）：
+  `RENAME_COLUMN_NOT_FOUND`；
+* 改名后源列名重复（两项新名收敛，或新名撞上未改名列；互换不算冲突）：`RENAME_CONFLICT`；
+* 构造出的新图复审与原图不一致：`RENAME_REVIEW_MISMATCH`（内部不变量，正常不会出现）；
+* 以及 `/api/review` 的全部原图校验（`DUPLICATE_NODE` / `COLUMN_CONFLICT` /
+  `INVALID_REFERENCE` / `CYCLE`）——整次请求先校验整张原图。
+
+`renames` 为空或缺失、原名重复、原名/新名为空字符串、未知字段、节点超过 60 等 schema
+问题返回 HTTP 422。
+
+成功响应包含：改名后的完整 `nodes`、原 `export`（ID 不变）、`renamed_columns`
+（实际发生变化的 `{old_name, new_name}`，按请求顺序），以及用原规则对新图**复审**的
+`review`。复审的每一列与原图按源列名映射后相同：透传的导出列名随改名变化，投影输出名/连接
+别名不变；`content_reasons` / `row_reasons` 中的源列名换成新名，`blocked` 结论不变。
+返回的图可直接再 POST 到 `/api/review`，结果与 `review` 完全一致。
+
+### 改名并用 POST /api/review 复审（可直接执行）
+
+```bash
+# 1) 发起改名（示例文件：uid→user_id_src、email→mail_src）
+curl -s -X POST http://localhost:8080/api/rename \
+  -H 'Content-Type: application/json' \
+  --data @examples/rename_request.json
+```
+
+返回（节选）：源列改名、筛选引用与投影 `copy` 随之改写；投影输出名 `user_id`/`mail`
+不变，常量 `bucket` 不动；敏感原因里的源列名变为 `mail_src`，`blocked` 仍为 `true`：
+
+```json
+{
+  "nodes": [
+    {"id": "users", "type": "source", "columns": [
+      {"name": "user_id_src", "sensitive": false},
+      {"name": "mail_src", "sensitive": true},
+      {"name": "country", "sensitive": false}]},
+    {"id": "only_cn", "type": "filter", "input": "users", "references": ["country"]},
+    {"id": "export_users", "type": "projection", "input": "only_cn", "columns": [
+      {"name": "user_id", "copy": "user_id_src"},
+      {"name": "mail", "copy": "mail_src"},
+      {"name": "bucket", "constant": "ALL"}]}
+  ],
+  "export": "export_users",
+  "renamed_columns": [
+    {"old_name": "uid", "new_name": "user_id_src"},
+    {"old_name": "email", "new_name": "mail_src"}],
+  "review": {"export": "export_users", "blocked": true, "columns": [
+    {"name": "user_id", "blocked": false, "content_reasons": [], "row_reasons": []},
+    {"name": "mail", "blocked": true,
+     "content_reasons": [{"node_id": "users", "column": "mail_src"}],
+     "row_reasons": []},
+    {"name": "bucket", "blocked": false, "content_reasons": [], "row_reasons": []}]}
+}
+```
+
+```bash
+# 2) 用原审查接口 POST /api/review 复审返回的图（需要 jq，应得 blocked: true）
+curl -s -X POST http://localhost:8080/api/rename \
+  -H 'Content-Type: application/json' \
+  --data @examples/rename_request.json \
+| jq '{nodes, export}' \
+| curl -s -X POST http://localhost:8080/api/review \
+  -H 'Content-Type: application/json' --data @-
+```
+
+筛选导出时名称随透传变化：源列经筛选直接导出，改名后复审的列名就是新名。互换也合法——
+`a↔b` 同时生效，敏感标记跟随原来的列：
+
+```bash
+curl -s -X POST http://localhost:8080/api/rename \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "nodes": [
+    {"id": "s", "type": "source",
+     "columns": [{"name": "a", "sensitive": true}, {"name": "b"}]},
+    {"id": "f", "type": "filter", "input": "s", "references": ["a"]}
+  ],
+  "export": "f",
+  "source": "s",
+  "renames": [{"old_name": "a", "new_name": "b"}, {"old_name": "b", "new_name": "a"}]
+}'
+# 源列顺序变为 b(敏感)、a；f.references 变为 ["b"]；
+# 复审列名为 b、a，两列 row_reasons 均为 {"node_id":"s","column":"b"}，blocked 为 true
+```
+
+非法源 / 缺失原列 / 改名冲突时返回 400 且不带任何部分图：
+
+```bash
+curl -s -i -X POST http://localhost:8080/api/rename \
+  -H 'Content-Type: application/json' \
+  -d "$(jq '.renames = [{"old_name":"ghost","new_name":"x"}]' examples/rename_request.json)"
+# HTTP/1.1 400 ... {"error":{"code":"RENAME_COLUMN_NOT_FOUND", ...
+```
+
 ## 节点 JSON 结构
 
 ```jsonc
@@ -508,11 +636,11 @@ python -m pytest tests/ -q
 ## 文件说明
 
 ```
-app/models.py     请求模型与结构约束（Pydantic；含 ReviseRequest 与 PruneRequest）
-app/engine.py     图校验、拓扑排序、来源传播、逐列审查、安全修订与按列精简
-app/main.py       FastAPI 入口（/api/review、/api/revise、/api/prune、/health）
-examples/         请求示例（request.json、revise_request.json、prune_request.json）
-tests/            传播规则、拒绝场景、修订/复审与精简测试
+app/models.py     请求模型与结构约束（Pydantic；含 ReviseRequest、PruneRequest 与 RenameRequest）
+app/engine.py     图校验、拓扑排序、来源传播、逐列审查、安全修订、按列精简与源列改名
+app/main.py       FastAPI 入口（/api/review、/api/revise、/api/prune、/api/rename、/health）
+examples/         请求示例（request.json、revise_request.json、prune_request.json、rename_request.json）
+tests/            传播规则、拒绝场景、修订/复审、精简与改名测试
 Dockerfile        容器镜像（python:3.11-slim，暴露 8080）
 docker-compose.yml 单命令编排
 ```

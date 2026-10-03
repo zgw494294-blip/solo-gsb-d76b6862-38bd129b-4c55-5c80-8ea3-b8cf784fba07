@@ -149,3 +149,38 @@ class PruneRequest(StrictModel):
                 )
             seen.add(name)
         return self
+
+
+class ColumnRenameIn(StrictModel):
+    """One source-column rename: the old name (resolved on the original graph)
+    and its non-empty new name."""
+
+    old_name: str = Field(min_length=1)
+    new_name: str = Field(min_length=1)
+
+
+class RenameRequest(StrictModel):
+    """A review request plus a source node and a non-empty rename list.
+
+    The old names are resolved against the original graph and must be distinct;
+    the new names must be non-empty. The renames apply simultaneously, so a
+    swap (a->b, b->a) is legal. The engine checks that the source exists and is
+    a source node, that every old name exists there, and that the resulting
+    source column names are distinct.
+    """
+
+    nodes: list[NodeIn] = Field(min_length=1, max_length=60)
+    export: str = Field(min_length=1)
+    source: str = Field(min_length=1)
+    renames: list[ColumnRenameIn] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _old_names_distinct(self) -> "RenameRequest":
+        seen: set[str] = set()
+        for item in self.renames:
+            if item.old_name in seen:
+                raise ValueError(
+                    f"renamed column '{item.old_name}' is listed more than once"
+                )
+            seen.add(item.old_name)
+        return self
