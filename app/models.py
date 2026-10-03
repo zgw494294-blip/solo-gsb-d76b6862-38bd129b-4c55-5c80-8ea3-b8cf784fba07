@@ -125,6 +125,57 @@ class ReviseRequest(StrictModel):
         return self
 
 
+class ColumnRenameIn(StrictModel):
+    """One source-column rename, resolved against the original graph.
+
+    All renames take effect simultaneously, so swaps are legal as long as the
+    source ends with distinct column names. The JSON field is ``from`` (a
+    Python keyword), aliased onto ``from_`` like ``copy`` is for projections.
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    from_: str = Field(alias="from", min_length=1)
+    to: str = Field(min_length=1)
+
+    @property
+    def old_name(self) -> str:
+        return self.from_
+
+    @property
+    def new_name(self) -> str:
+        return self.to
+
+
+class RenameRequest(StrictModel):
+    """A review request plus a source node id and a non-empty rename list.
+
+    The whole graph is validated by the same rules as ``ReviewRequest`` before
+    anything is renamed. The original column names must be non-empty, mutually
+    distinct and exist on the named source node; every new name must be
+    non-empty and the source's final column names must be distinct. Existence
+    and final-name conflicts are checked in the engine together with the rest
+    of the graph, so schema problems alone are rejected as 422.
+    """
+
+    nodes: list[NodeIn] = Field(min_length=1, max_length=60)
+    export: str = Field(min_length=1)
+    source: str = Field(min_length=1)
+    renames: list[ColumnRenameIn] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _old_names_distinct(self) -> "RenameRequest":
+        seen: set[str] = set()
+        for item in self.renames:
+            if item.old_name in seen:
+                raise ValueError(
+                    f"rename for source column '{item.old_name}' is listed more "
+                    "than once"
+                )
+            seen.add(item.old_name)
+        return self
+
+
 class PruneRequest(StrictModel):
     """A review request plus the export columns the caller wants to keep.
 
